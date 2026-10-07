@@ -421,7 +421,7 @@ class FineARTVLATextTokenizerStep(ProcessorStep):
 
 
 if TYPE_CHECKING:
-    from lerobot.datasets.recipe import TrainingRecipe
+    from lerobot.datasets import TrainingRecipe
 
 
 def make_fineart_vla_pre_post_processors(
@@ -456,7 +456,7 @@ def make_fineart_vla_pre_post_processors(
     if config.input_features is None or config.output_features is None or config.device is None:
         raise ValueError("FineART-VLA processors require input/output features and a device")
 
-    from lerobot.datasets.recipe import TrainingRecipe  # recipes need the dataset extras
+    from lerobot.datasets import TrainingRecipe  # recipes need the dataset extras
 
     recipe = TrainingRecipe.from_dict(config.recipe)
 
@@ -537,7 +537,7 @@ def _load_recipe(path_str: str) -> TrainingRecipe:
     Accepts an absolute path or a path relative to
     ``src/lerobot/configs/``.
     """
-    from lerobot.datasets.recipe import TrainingRecipe  # recipes need the dataset extras
+    from lerobot.datasets import TrainingRecipe  # recipes need the dataset extras
 
     p = Path(path_str)
     if not p.is_absolute() and not p.exists():
