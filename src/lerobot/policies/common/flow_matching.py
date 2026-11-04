@@ -39,6 +39,8 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from torch import Tensor
 
+from lerobot.utils.trinity_gate import boundary as gate_boundary
+
 if TYPE_CHECKING:
     from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 
@@ -354,6 +356,9 @@ def euler_integrate(
     )
     x_t = noise
     for step in range(num_steps):
+        # Hold point for an external GPU scheduler: after the prefix on step 0, then
+        # between denoising steps. No-op unless TSG_CB is set (lerobot.utils.trinity_gate).
+        gate_boundary(device)
         if time_grid is None:
             dt = uniform_dt
             time_tensor = (

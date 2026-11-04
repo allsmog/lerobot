@@ -52,6 +52,7 @@ from lerobot.transport import (
     PresenceEvent,
     ZenohTransport,
 )
+from lerobot.utils.trinity_gate import boundary as gate_boundary
 
 from .chunk_contract import (
     CHUNK_ALIGNMENT,
@@ -589,6 +590,9 @@ class SessionWorker:
             and session.chunk_settings["chunk_merge"] == "aligned"
         ):
             identity.update({key: body[key] for key in ("observation_cursor", "cursor")})
+        # Hold point for an external GPU scheduler before any model work starts.
+        # No-op unless TSG_CB is set (see lerobot.utils.trinity_gate).
+        gate_boundary(self.runner.policy.config.device)
         if message.message_type is MessageType.LANGUAGE_REQUEST:
             answer = self.runner.query(observation, kind=body["kind"], text=body["text"])
             if (
