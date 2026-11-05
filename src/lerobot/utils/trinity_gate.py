@@ -111,6 +111,57 @@ def boundary(device: torch.device | str | None = None) -> dict | None:
     return _current_impl().gate_boundary(_device_synchronizer(device))
 
 
+# Module paths, relative to a loaded policy, whose calls make up the vision-language prefix
+# pass. Each entry is (path to a layer list, submodule of each layer to hook or None for the
+# layer itself). Paths that do not resolve are skipped, so one list serves several policies.
+PREFIX_MODULE_PATHS: tuple[tuple[str, str | None], ...] = (
+    ("model.paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers", None),
+    ("model.paligemma_with_expert.paligemma.model.language_model.layers", None),
+    ("model.vlm_with_expert.vlm.model.vision_model.encoder.layers", None),
+    # SmolVLA calls its text layers piecewise; input_layernorm runs only on the prefix stream.
+    ("model.vlm_with_expert.vlm.model.text_model.layers", "input_layernorm"),
+)
+
+
+def _resolve(root: Any, path: str) -> Any:
+    obj = root
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def install_prefix_boundaries(policy: torch.nn.Module, device: torch.device | str | None = None) -> int:
+    """Add a hold point before each layer of the policy's vision-language prefix pass.
+
+    The prefix pass runs before the first denoising step and has no other hold point
+    (measured 4 November 2026: 41 ms of a 134 ms SmolVLA call, 254 ms of a 357 ms pi0.5
+    call on an RTX 3060). Each hook calls :func:`boundary`, so with ``TSG_CB`` unset it
+    returns immediately and behavior is unchanged. Returns the number of hooks installed.
+    """
+    count = 0
+    for path, sub in PREFIX_MODULE_PATHS:
+        layers = _resolve(policy, path)
+        if layers is None:
+            continue
+        for layer in layers:
+            module = getattr(layer, sub, None) if sub else layer
+            if module is None:
+                continue
+            module.register_forward_pre_hook(_prefix_hook(device))
+            count += 1
+    return count
+
+
+def _prefix_hook(device: torch.device | str | None) -> Callable[[torch.nn.Module, Any], None]:
+    def hook(_module: torch.nn.Module, _args: Any) -> None:
+        # A forward pre-hook's return value replaces the module inputs, so return None.
+        boundary(device)
+
+    return hook
+
+
 def reset_for_tests() -> None:
     """Drop the cached implementation so tests can change the environment."""
     global _impl, _impl_key

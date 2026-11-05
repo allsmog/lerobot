@@ -32,6 +32,7 @@ from lerobot.policies import PreTrainedPolicy, get_policy_class, make_pre_post_p
 from lerobot.policies.factory import has_peft_adapter_config
 from lerobot.processor import RenderRuntimeMessagesStep
 from lerobot.utils.import_utils import _peft_available, require_package
+from lerobot.utils.trinity_gate import install_prefix_boundaries
 
 from .configs import ServerConfig
 
@@ -155,6 +156,8 @@ def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner, str]:
     else:
         policy = policy_class.from_pretrained(path, config=policy_cfg)
     policy.to(cfg.model.device).eval()
+    # Hold points for an external GPU scheduler inside the prefix pass (no-op unless TSG_CB is set).
+    install_prefix_boundaries(policy, cfg.model.device)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_cfg,
         pretrained_path=path,

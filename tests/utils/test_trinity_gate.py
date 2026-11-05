@@ -121,3 +121,74 @@ def test_gate_loads_package_with_relative_imports(monkeypatch, tmp_path):
     monkeypatch.setenv("TSG_GATE_IMPL", str(pkg))
     assert trinity_gate.boundary("cpu") == {"outcome": "pass", "path": str(cb)}
     assert [str(cb)] == trinity_gate._current_impl().CALLS
+
+
+class _Layer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_layernorm = torch.nn.Identity()
+        self.lin = torch.nn.Linear(3, 3)
+
+    def forward(self, x):
+        return self.lin(self.input_layernorm(x))
+
+
+def _fake_policy(vision_layers, text_layers):
+    """Shaped like SmolVLA: model.vlm_with_expert.vlm.model.{vision_model.encoder,text_model}.layers."""
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    root.model.vlm_with_expert = torch.nn.Module()
+    root.model.vlm_with_expert.vlm = torch.nn.Module()
+    vlm = root.model.vlm_with_expert.vlm.model = torch.nn.Module()
+    vlm.vision_model = torch.nn.Module()
+    vlm.vision_model.encoder = torch.nn.Module()
+    vlm.vision_model.encoder.layers = torch.nn.ModuleList(_Layer() for _ in range(vision_layers))
+    vlm.text_model = torch.nn.Module()
+    vlm.text_model.layers = torch.nn.ModuleList(_Layer() for _ in range(text_layers))
+    return root
+
+
+def test_prefix_boundaries_hook_each_prefix_layer(monkeypatch):
+    policy = _fake_policy(vision_layers=2, text_layers=3)
+    assert trinity_gate.install_prefix_boundaries(policy, "cpu") == 5
+    calls = []
+    monkeypatch.setattr(trinity_gate, "boundary", lambda device=None: calls.append(device))
+    x = torch.zeros(1, 3)
+    vlm = policy.model.vlm_with_expert.vlm.model
+    for layer in vlm.vision_model.encoder.layers:
+        x = layer(x)
+    for layer in vlm.text_model.layers:
+        x = layer(x)
+    assert calls == ["cpu"] * 5
+
+
+def test_prefix_boundaries_are_noop_and_output_identical_with_gate_off():
+    torch.manual_seed(0)
+    policy = _fake_policy(vision_layers=1, text_layers=2)
+    x = torch.randn(2, 3)
+    layers = list(policy.model.vlm_with_expert.vlm.model.text_model.layers)
+    before = layers[1](layers[0](x))
+    trinity_gate.install_prefix_boundaries(policy, "cpu")
+    after = layers[1](layers[0](x))
+    torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+
+def test_prefix_boundaries_skip_unknown_policies():
+    assert trinity_gate.install_prefix_boundaries(torch.nn.Linear(2, 2), "cpu") == 0
+
+
+def test_prefix_boundaries_keep_module_inputs_with_gate_on(monkeypatch, tmp_path):
+    # The real gate returns a result dict; a pre-hook must not pass it on as the module input.
+    impl = tmp_path / "main.py"
+    impl.write_text(FAKE_IMPL)
+    monkeypatch.setenv("TSG_CB", str(tmp_path / "tsg.cb"))
+    monkeypatch.setenv("TSG_GATE_IMPL", str(impl))
+    torch.manual_seed(0)
+    policy = _fake_policy(vision_layers=1, text_layers=1)
+    layer = policy.model.vlm_with_expert.vlm.model.vision_model.encoder.layers[0]
+    x = torch.randn(2, 3)
+    before = layer(x)
+    trinity_gate.install_prefix_boundaries(policy, "cpu")
+    after = layer(x)
+    torch.testing.assert_close(after, before, rtol=0, atol=0)
+    assert len(trinity_gate._current_impl().CALLS) == 1
