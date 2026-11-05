@@ -93,8 +93,17 @@ def _offer(slot: EngineSlot, now_ns: int, obs_frame: Any) -> dict[str, Any] | No
     time, so the arbiter can judge them fresh or stale and count deadline misses. An
     engine that has never produced an action offers nothing (``starved``).
     """
+    denied = False
+
+    def note_denied() -> None:
+        nonlocal denied
+        denied = True
+
     had_need = slot.interpolator.needs_new_action()
-    target = next_interpolated_action(slot.engine, slot.interpolator, obs_frame, hold=None)
+    target = next_interpolated_action(slot.engine, slot.interpolator, obs_frame, hold=note_denied)
+    if denied:
+        slot.produced_ns, slot.last_values = None, None
+        return None
     if target is not None:
         if had_need:
             # After an exhausted buffer the interpolator only returns a target when a
@@ -123,19 +132,31 @@ def multi_engine_tick(
 
     ``last_command`` holds the most recent value sent for each feature; a held feature
     repeats it. If a held feature has never been commanded, nothing is sent this tick.
-    After a send, every engine whose offered value was used records the dispatch.
+    The arbiter must report each selected engine in ``dispatch_sources``. After a
+    send, only engines whose attributed features survived the final gate record a
+    dispatch. ``decision`` retains the arbiter proposal; ``sent`` and ``contributing``
+    describe the result after the permission checks.
     """
+    by_id = {slot.engine_id: slot for slot in slots}
+    if len(by_id) != len(slots):
+        raise ValueError("engine slots must have unique engine_id values")
     offers = {slot.engine_id: _offer(slot, now_ns, obs_frame) for slot in slots}
     decision = arbiter.tick(now_ns, offers)
     dispatch: dict[str, float] = dict(decision["dispatch"])
-
-    # Engines whose offered value was used for at least one dispatched feature.
-    contributing = [
-        slot
-        for slot in slots
-        if offers[slot.engine_id] is not None
-        and any(offers[slot.engine_id]["values"].get(key) == value for key, value in dispatch.items())
-    ]
+    sources = decision.get("dispatch_sources")
+    if not isinstance(sources, Mapping) or set(sources) != set(dispatch):
+        raise ValueError("arbiter decision requires dispatch_sources for exactly the dispatched features")
+    if not set(dispatch).issubset(all_features):
+        raise ValueError("arbiter dispatched an unknown action feature")
+    for feature, engine_id in sources.items():
+        if not isinstance(engine_id, str) or engine_id not in by_id:
+            raise ValueError(f"arbiter dispatch source for {feature!r} names an unknown engine")
+        offer = offers[engine_id]
+        if offer is None or feature not in offer["values"] or offer["values"][feature] != dispatch[feature]:
+            raise ValueError(f"arbiter dispatch source for {feature!r} does not match the engine offer")
+    # Source identity is supplied by the policy. Equal values convey no ownership.
+    selected = set(sources.values())
+    contributing = [slot for slot in slots if slot.engine_id in selected]
     # Final permission gate, as in ``commit_action``: a denying engine's values are
     # withdrawn and its features fall back to holding.
     permitted = []
@@ -144,9 +165,10 @@ def multi_engine_tick(
             permitted.append(slot)
             continue
         slot.interpolator.reset()
+        slot.produced_ns, slot.last_values = None, None
         slot.engine.acknowledge_hold()
-        for key, value in offers[slot.engine_id]["values"].items():
-            if dispatch.get(key) == value:
+        for key, engine_id in sources.items():
+            if engine_id == slot.engine_id:
                 del dispatch[key]
 
     command = {}
@@ -159,6 +181,8 @@ def multi_engine_tick(
             return TickResult(decision=decision, sent=None, contributing=[])
     send(command)
     last_command.update(command)
+    sent_sources = {sources[key] for key in dispatch}
+    permitted = [slot for slot in permitted if slot.engine_id in sent_sources]
     for slot in permitted:
         slot.engine.record_dispatch()
     return TickResult(decision=decision, sent=command, contributing=[s.engine_id for s in permitted])

@@ -40,7 +40,7 @@ FAKE_ARBITER = textwrap.dedent(
                 eid: o for eid, o in offers.items()
                 if o is not None and now_ns - o["produced_ns"] <= self.engines[eid]["deadline_ns"]
             }
-            dispatch, hold, events = {}, [], []
+            dispatch, sources, hold, events = {}, {}, [], []
             for eid, o in offers.items():
                 if o is None:
                     events.append({"kind": "starved", "engine_id": eid})
@@ -54,7 +54,8 @@ FAKE_ARBITER = textwrap.dedent(
                     hold.append(feature)
                 else:
                     dispatch[feature] = fresh[src]["values"][feature]
-            return {"dispatch": dispatch, "hold": sorted(hold), "events": events}
+                    sources[feature] = src
+            return {"dispatch": dispatch, "dispatch_sources": sources, "hold": sorted(hold), "events": events}
 
         def summary(self):
             return {"ticks": self.ticks}
