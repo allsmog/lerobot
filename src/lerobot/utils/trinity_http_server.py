@@ -124,7 +124,10 @@ class LiberoChunkPolicy:
         cfg.pretrained_path = Path(policy_path)
         cfg.device = device
         if dtype is not None and hasattr(cfg, "dtype"):
-            cfg.dtype = dtype
+            precision = getattr(torch, dtype, None)
+            if not isinstance(precision, torch.dtype):
+                raise ValueError(f"invalid policy dtype: {dtype!r}")
+            cfg.dtype = precision
         for key, value in (overrides or {}).items():  # as lerobot-eval --policy.<key>=<value>
             if not hasattr(cfg, key):
                 raise ValueError(f"policy config has no field {key!r}")
