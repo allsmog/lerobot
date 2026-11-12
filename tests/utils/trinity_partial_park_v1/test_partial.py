@@ -120,6 +120,24 @@ def test_default_metadata_and_full_parking_remain_unchanged() -> None:
     }
 
 
+def test_resident_storage_account_deduplicates_parameter_aliases() -> None:
+    store = cache(Weights(), 64)
+    assert store.metadata()["last_resident_parameter_storage_bytes"] == 0
+    assert store.metadata()["last_resident_parameter_storages"] == 0
+    store.park()
+    assert store.metadata()["last_resident_parameter_storage_bytes"] == 80
+    assert store.metadata()["last_resident_parameter_storages"] == 2
+
+
+def test_resident_storage_account_charges_full_shared_roots_once() -> None:
+    store = cache(Views(), 32)
+    assert store.parameter_bytes == 32
+    store.park()
+    assert store.metadata()["last_resident_parameter_storage_bytes"] == 64
+    assert store.metadata()["last_resident_parameter_storages"] == 1
+    assert store.metadata()["last_park_retained_storage_bytes"] == 0
+
+
 @pytest.mark.parametrize("limit", [-1, True, 1.5, "64"])
 def test_invalid_storage_cap_is_refused_before_shadow_allocation(limit: Any) -> None:
     model = Weights()

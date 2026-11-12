@@ -44,6 +44,8 @@ class ParameterShadow:
         self.park_retain_bytes = park_retain_bytes
         self.last_retained_storage_bytes = 0
         self.last_retained_parameters = 0
+        self.last_resident_storage_bytes = 0
+        self.last_resident_storages = 0
         params = dict(policy.named_parameters())
         if not params:
             raise ValueError("parameter shadows require model parameters")
@@ -90,10 +92,10 @@ class ParameterShadow:
         if self.device.type == "cuda":
             self.torch.cuda.synchronize(self.device)
 
-    def _retained(self, params: dict[str, Any]) -> tuple[set[int], int]:
+    def _retained(self, params: dict[str, Any]) -> tuple[set[int], int, int, int]:
         """Keep complete storage groups, including distinct parameters sharing a view."""
         if not self.park_retain_bytes:
-            return set(), 0
+            return set(), 0, 0, 0
         groups: dict[tuple[str, int | None, int], tuple[int, list[str]]] = {}
         for name, param in params.items():
             storage = param.untyped_storage()
@@ -111,7 +113,7 @@ class ParameterShadow:
                 continue
             kept.update(id(params[name]) for name in names)
             used += size
-        return kept, used
+        return kept, used, sum(size for size, _ in groups.values()), len(groups)
 
     def park(self) -> dict[str, int | bool]:
         params = dict(self.policy.named_parameters())
@@ -124,7 +126,7 @@ class ParameterShadow:
                     refreshed += 1
         self._synchronize()
         by_id = {id(param): self.shadows[name] for name, param in params.items()}
-        retained, retained_bytes = self._retained(params)
+        retained, retained_bytes, resident_bytes, resident_storages = self._retained(params)
 
         def move(tensor: Any) -> Any:
             # Module._apply supplies the actual Parameter objects and buffers.
@@ -137,6 +139,8 @@ class ParameterShadow:
         self.last_refreshed = refreshed
         self.last_retained_storage_bytes = retained_bytes
         self.last_retained_parameters = len(retained)
+        self.last_resident_storage_bytes = resident_bytes
+        self.last_resident_storages = resident_storages
         return self.metadata()
 
     def resumed(self) -> None:
@@ -157,5 +161,7 @@ class ParameterShadow:
                 park_retain_limit_bytes=self.park_retain_bytes,
                 last_park_retained_storage_bytes=self.last_retained_storage_bytes,
                 last_park_retained_parameters=self.last_retained_parameters,
+                last_resident_parameter_storage_bytes=self.last_resident_storage_bytes,
+                last_resident_parameter_storages=self.last_resident_storages,
             )
         return result
