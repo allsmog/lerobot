@@ -1064,6 +1064,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 class PI05Policy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
 
+    supports_action_chunk_observer = True
     config_class = PI05Config
     name = "pi05"
     model_class = PI05Pytorch
@@ -1516,12 +1517,15 @@ class PI05Policy(PreTrainedPolicy):
         batch: dict[str, Tensor],
         *,
         noise: Tensor | None = None,
+        action_chunk_observer: Callable[[Tensor], None] | None = None,
         **kwargs: Unpack[RTCActionSelectKwargs],
     ) -> Tensor:
         """Predict a chunk of actions given environment observations.
 
         `noise` is the starting sample of the denoising loop, shaped
         (batch_size, chunk_size, max_action_dim). When it is None, fresh noise is drawn.
+        An optional observer receives the padded denoised chunk before action dimensions
+        are removed. The returned actions and denoising algorithm remain unchanged.
         """
         self.eval()
 
@@ -1544,6 +1548,9 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.model.sample_actions(
             images, img_masks, tokens, masks, states=states, state_masks=state_masks, noise=noise, **kwargs
         )
+
+        if action_chunk_observer is not None:
+            action_chunk_observer(actions)
 
         # Unpad actions to actual action dimension
         if self.config.output_features is None:

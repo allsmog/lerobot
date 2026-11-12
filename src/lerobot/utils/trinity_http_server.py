@@ -269,10 +269,21 @@ class LiberoChunkPolicy:
         noise = checked_noise(self.policy.config, arrays)
         noise_fingerprint = input_fingerprint = None
         predict_options: dict[str, Any] = {}
+        predicted = None
+        observe_padded = (
+            noise is not None and getattr(self.policy, "supports_action_chunk_observer", False) is True
+        )
         if noise is not None:
             noise_fingerprint = array_sha256(noise)
             input_fingerprint = observation_sha256(task, arrays, REQUEST_ARRAYS)
             predict_options["noise"] = torch.from_numpy(noise).to(device=self.device, dtype=torch.float32)
+            if observe_padded:
+
+                def capture_prediction(value: Any) -> None:
+                    nonlocal predicted
+                    predicted = value.detach().to("cpu").float().numpy().copy()
+
+                predict_options["action_chunk_observer"] = capture_prediction
         observation: dict[str, Any] = {
             "pixels": {
                 "image": arrays["agentview_image"][None],
@@ -295,9 +306,11 @@ class LiberoChunkPolicy:
         observation = self.preprocessor(observation)
         with torch.inference_mode():
             chunk: Any = self.policy.predict_action_chunk(observation, **predict_options)
-        predicted = None
         if noise is not None:
-            predicted = chunk.detach().to("cpu").float().numpy().copy()
+            if observe_padded and predicted is None:
+                raise ValueError("policy did not expose its padded predictions")
+            if predicted is None:
+                predicted = chunk.detach().to("cpu").float().numpy().copy()
             if predicted.ndim != 3 or predicted.shape[0] != 1 or not np.isfinite(predicted).all():
                 raise ValueError("policy returned invalid full predictions for controlled noise")
         action_count: Any = getattr(self.policy.config, "n_action_steps", chunk.shape[1])
