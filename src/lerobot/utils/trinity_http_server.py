@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from lerobot.utils.trinity_residency_shadow import ParameterShadow
+    from lerobot.utils.trinity_vocab_placement import CpuVocabularyPlacement
 
 import numpy as np
 
@@ -114,7 +115,14 @@ class LiberoChunkPolicy:
         allow_residency: bool = False,
         residency_retain_mib: int = 0,
         batch_action_postprocess: bool = False,
+        residency_cpu_vocabulary: bool = False,
     ) -> None:
+        if not isinstance(residency_cpu_vocabulary, bool):
+            raise ValueError("CPU vocabulary placement must be a boolean")
+        if residency_cpu_vocabulary and not allow_residency:
+            raise ValueError("CPU vocabulary placement requires owned residency")
+        self.residency_cpu_vocabulary = residency_cpu_vocabulary
+        self._cpu_vocabulary: CpuVocabularyPlacement | None = None
         if not isinstance(batch_action_postprocess, bool):
             raise ValueError("batch action postprocessing must be a boolean")
         self.batch_action_postprocess = batch_action_postprocess
@@ -205,21 +213,30 @@ class LiberoChunkPolicy:
             from lerobot.utils.trinity_residency_shadow import ParameterShadow
 
             try:
+                shadow_options: dict[str, Any] = {}
+                if getattr(self, "residency_retain_bytes", 0):
+                    shadow_options["park_retain_bytes"] = self.residency_retain_bytes
+                if getattr(self, "residency_cpu_vocabulary", False):
+                    from lerobot.utils.trinity_vocab_placement import prepare_pi05_cpu_vocabulary
+
+                    self._cpu_vocabulary = prepare_pi05_cpu_vocabulary(
+                        self.policy, self.torch, self.device, host_reserve_bytes, self._vocabulary_fault
+                    )
+                    shadow_options["resident_cpu_names"] = self._cpu_vocabulary.cpu_names
                 self._residency_shadow = ParameterShadow(
                     self.policy,
                     self.torch,
                     self.device,
                     host_reserve_bytes,
-                    **(
-                        {"park_retain_bytes": self.residency_retain_bytes}
-                        if getattr(self, "residency_retain_bytes", 0)
-                        else {}
-                    ),
+                    **shadow_options,
                 )
             except BaseException:
                 self.residency_state = "fault"
                 raise
         return self._residency_shadow.metadata()
+
+    def _vocabulary_fault(self) -> None:
+        self.residency_state = "fault"
 
     def residency(self, action: str) -> dict[str, Any]:
         """Move an idle policy under the same lock used for inference.
@@ -243,10 +260,17 @@ class LiberoChunkPolicy:
             try:
                 self.torch.cuda.synchronize(self.device)
                 shadow = getattr(self, "_residency_shadow", None)
+                if getattr(self, "residency_cpu_vocabulary", False) and shadow is None:
+                    raise RuntimeError(
+                        "prepare the owned CPU vocabulary shadow before a residency transition"
+                    )
                 if shadow is not None and target == "parked":
                     shadow.park()
                 elif shadow is not None:
-                    self.policy.to(self.device, non_blocking=True)
+                    if getattr(self, "residency_cpu_vocabulary", False):
+                        shadow.restore()
+                    else:
+                        self.policy.to(self.device, non_blocking=True)
                 else:
                     self.policy.to("cpu" if target == "parked" else self.device)
                 if target == "parked":
@@ -254,6 +278,9 @@ class LiberoChunkPolicy:
                 self.torch.cuda.synchronize(self.device)
                 if shadow is not None and target == "resident":
                     shadow.resumed()
+                placement = getattr(self, "_cpu_vocabulary", None)
+                if placement is not None:
+                    placement.check()
                 self.residency_state = target
             except BaseException:
                 self.residency_state = "fault"
@@ -275,6 +302,9 @@ class LiberoChunkPolicy:
         shadow = getattr(self, "_residency_shadow", None)
         if shadow is not None:
             result["parameter_shadow"] = shadow.metadata()
+        if getattr(self, "residency_cpu_vocabulary", False):
+            placement = getattr(self, "_cpu_vocabulary", None)
+            result["cpu_vocabulary"] = {"prepared": False} if placement is None else placement.metadata()
         return result
 
     def chunk(self, task: str, arrays: dict[str, np.ndarray]) -> np.ndarray:
@@ -293,6 +323,9 @@ class LiberoChunkPolicy:
         torch = self.torch
         self.last_inference_metadata = None
         self.last_policy_chunk = None
+        placement = getattr(self, "_cpu_vocabulary", None)
+        if placement is not None:
+            placement.check()
         if getattr(self, "batch_action_postprocess", False):
             from lerobot.utils.trinity_action_postprocess import check_batch_postprocess
 
@@ -531,6 +564,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--residency", action="store_true", help="allow request-safe CPU/GPU park and resume")
     parser.add_argument(
+        "--residency-cpu-vocabulary",
+        action="store_true",
+        help="keep the qualified pi05 vocabulary tables on CPU; requires --residency",
+    )
+    parser.add_argument(
         "--batch-action-postprocess",
         action="store_true",
         help="batch the qualified stateless pi05 output processors and CPU copy",
@@ -544,6 +582,8 @@ def main(argv: list[str] | None = None) -> int:
     options = parser.parse_args(argv)
     if options.residency_retain_mib < 0 or (options.residency_retain_mib and not options.residency):
         parser.error("--residency-retain-mib needs a nonnegative value and --residency when nonzero")
+    if options.residency_cpu_vocabulary and not options.residency:
+        parser.error("--residency-cpu-vocabulary requires --residency")
     owner = checked_owner(os.environ.get("TRINITY_LEROBOT_OWNER_NONCE")) if options.residency else None
     model = LiberoChunkPolicy(
         options.policy_path,
@@ -555,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_residency=options.residency,
         **({"residency_retain_mib": options.residency_retain_mib} if options.residency_retain_mib else {}),
         **({"batch_action_postprocess": True} if options.batch_action_postprocess else {}),
+        **({"residency_cpu_vocabulary": True} if options.residency_cpu_vocabulary else {}),
     )
     server = http.server.ThreadingHTTPServer(
         (options.host, options.port), make_handler(model, threading.Lock(), owner)

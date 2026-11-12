@@ -21,6 +21,7 @@ class ParameterShadow:
         host_reserve_bytes: int,
         *,
         park_retain_bytes: int = 0,
+        resident_cpu_names: tuple[str, ...] = (),
     ) -> None:
         if (
             isinstance(host_reserve_bytes, bool)
@@ -41,6 +42,13 @@ class ParameterShadow:
             raise ValueError("parameter shadows require the qualified module conversion flags")
         self.policy, self.torch = policy, torch
         self.device = torch.device(resident_device)
+        if (
+            not isinstance(resident_cpu_names, tuple)
+            or any(not isinstance(name, str) or not name for name in resident_cpu_names)
+            or len(set(resident_cpu_names)) != len(resident_cpu_names)
+        ):
+            raise ValueError("resident CPU parameter names must be a distinct tuple of names")
+        self.resident_cpu_names = frozenset(resident_cpu_names)
         self.park_retain_bytes = park_retain_bytes
         self.last_retained_storage_bytes = 0
         self.last_retained_parameters = 0
@@ -49,6 +57,8 @@ class ParameterShadow:
         params = dict(policy.named_parameters())
         if not params:
             raise ValueError("parameter shadows require model parameters")
+        if not self.resident_cpu_names <= params.keys():
+            raise ValueError("resident CPU parameter names must exist in the policy")
         self.signatures = {name: (tuple(param.shape), param.dtype) for name, param in params.items()}
         self._check(params)
         self.parameter_bytes = sum(param.numel() * param.element_size() for param in params.values())
@@ -72,7 +82,7 @@ class ParameterShadow:
         self.versions = {name: (id(param), int(param._version)) for name, param in params.items()}
         self.last_refreshed = 0
 
-    def _check(self, params: dict[str, Any]) -> None:
+    def _check(self, params: dict[str, Any], *, allow_parked: bool = False) -> None:
         if self.policy.training:
             raise ValueError("parameter shadows support inference mode only")
         if params.keys() != self.signatures.keys():
@@ -82,8 +92,11 @@ class ParameterShadow:
                 raise RuntimeError("model parameter signature changed: " + name)
             if param.layout != self.torch.strided or param.is_quantized or param.grad is not None:
                 raise ValueError("parameter shadows require dense parameters without gradients")
-            if param.device.type != self.device.type or (
-                self.device.index is not None and param.device.index != self.device.index
+            expected = self.torch.device("cpu") if name in self.resident_cpu_names else self.device
+            parked = allow_parked and name not in self.resident_cpu_names and param.device.type == "cpu"
+            if not parked and (
+                param.device.type != expected.type
+                or (expected.index is not None and param.device.index != expected.index)
             ):
                 raise RuntimeError("model parameter is not on its resident device: " + name)
             int(param._version)  # Refuse inference tensors without a version counter.
@@ -98,6 +111,8 @@ class ParameterShadow:
             return set(), 0, 0, 0
         groups: dict[tuple[str, int | None, int], tuple[int, list[str]]] = {}
         for name, param in params.items():
+            if name in self.resident_cpu_names:
+                continue
             storage = param.untyped_storage()
             size = int(storage.nbytes())
             key = (param.device.type, param.device.index, int(storage.data_ptr()))
@@ -115,7 +130,7 @@ class ParameterShadow:
             used += size
         return kept, used, sum(size for size, _ in groups.values()), len(groups)
 
-    def park(self) -> dict[str, int | bool]:
+    def park(self) -> dict[str, Any]:
         params = dict(self.policy.named_parameters())
         self._check(params)
         refreshed = 0
@@ -143,13 +158,24 @@ class ParameterShadow:
         self.last_resident_storages = resident_storages
         return self.metadata()
 
+    def restore(self) -> None:
+        """Restore GPU parameters and buffers while preserving declared CPU tables."""
+        params = dict(self.policy.named_parameters())
+        self._check(params, allow_parked=True)
+        cpu_ids = {id(params[name]) for name in self.resident_cpu_names}
+
+        def move(tensor: Any) -> Any:
+            return tensor if id(tensor) in cpu_ids else tensor.to(self.device, non_blocking=True)
+
+        self.policy._apply(move)
+
     def resumed(self) -> None:
         params = dict(self.policy.named_parameters())
         self._check(params)
         self.versions = {name: (id(param), int(param._version)) for name, param in params.items()}
 
-    def metadata(self) -> dict[str, int | bool]:
-        result: dict[str, int | bool] = {
+    def metadata(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "parameter_count": len(self.shadows),
             "parameter_bytes": self.parameter_bytes,
             "pinned": self.device.type == "cuda",
@@ -163,5 +189,16 @@ class ParameterShadow:
                 last_park_retained_parameters=self.last_retained_parameters,
                 last_resident_parameter_storage_bytes=self.last_resident_storage_bytes,
                 last_resident_parameter_storages=self.last_resident_storages,
+            )
+        if self.resident_cpu_names:
+            params = dict(self.policy.named_parameters())
+            roots = {
+                int(params[name].untyped_storage().data_ptr()): int(params[name].untyped_storage().nbytes())
+                for name in self.resident_cpu_names
+            }
+            result.update(
+                resident_cpu_parameter_names=sorted(self.resident_cpu_names),
+                resident_cpu_storage_bytes=sum(roots.values()),
+                resident_cpu_storages=len(roots),
             )
         return result
