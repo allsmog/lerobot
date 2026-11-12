@@ -112,7 +112,17 @@ class LiberoChunkPolicy:
         overrides: dict[str, Any] | None = None,
         *,
         allow_residency: bool = False,
+        residency_retain_mib: int = 0,
     ) -> None:
+        if (
+            isinstance(residency_retain_mib, bool)
+            or not isinstance(residency_retain_mib, int)
+            or residency_retain_mib < 0
+        ):
+            raise ValueError("residency retention must be a nonnegative integer MiB count")
+        if residency_retain_mib and not allow_residency:
+            raise ValueError("residency retention requires owned residency")
+        self.residency_retain_bytes = residency_retain_mib * 1024**2
         import torch
 
         from lerobot.configs.policies import PreTrainedConfig
@@ -184,7 +194,15 @@ class LiberoChunkPolicy:
 
             try:
                 self._residency_shadow = ParameterShadow(
-                    self.policy, self.torch, self.device, host_reserve_bytes
+                    self.policy,
+                    self.torch,
+                    self.device,
+                    host_reserve_bytes,
+                    **(
+                        {"park_retain_bytes": self.residency_retain_bytes}
+                        if getattr(self, "residency_retain_bytes", 0)
+                        else {}
+                    ),
                 )
             except BaseException:
                 self.residency_state = "fault"
@@ -486,7 +504,15 @@ def main(argv: list[str] | None = None) -> int:
         "--policy-overrides", default="{}", help="JSON policy config fields, as lerobot-eval --policy.<field>"
     )
     parser.add_argument("--residency", action="store_true", help="allow request-safe CPU/GPU park and resume")
+    parser.add_argument(
+        "--residency-retain-mib",
+        type=int,
+        default=0,
+        help="maximum parameter storage to retain while parked; requires --residency",
+    )
     options = parser.parse_args(argv)
+    if options.residency_retain_mib < 0 or (options.residency_retain_mib and not options.residency):
+        parser.error("--residency-retain-mib needs a nonnegative value and --residency when nonzero")
     owner = checked_owner(os.environ.get("TRINITY_LEROBOT_OWNER_NONCE")) if options.residency else None
     model = LiberoChunkPolicy(
         options.policy_path,
@@ -496,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
         json.loads(options.rename_map),
         json.loads(options.policy_overrides),
         allow_residency=options.residency,
+        **({"residency_retain_mib": options.residency_retain_mib} if options.residency_retain_mib else {}),
     )
     server = http.server.ThreadingHTTPServer(
         (options.host, options.port), make_handler(model, threading.Lock(), owner)
