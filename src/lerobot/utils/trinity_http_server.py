@@ -113,7 +113,11 @@ class LiberoChunkPolicy:
         *,
         allow_residency: bool = False,
         residency_retain_mib: int = 0,
+        batch_action_postprocess: bool = False,
     ) -> None:
+        if not isinstance(batch_action_postprocess, bool):
+            raise ValueError("batch action postprocessing must be a boolean")
+        self.batch_action_postprocess = batch_action_postprocess
         if (
             isinstance(residency_retain_mib, bool)
             or not isinstance(residency_retain_mib, int)
@@ -146,6 +150,10 @@ class LiberoChunkPolicy:
             if not hasattr(cfg, key):
                 raise ValueError(f"policy config has no field {key!r}")
             setattr(cfg, key, value)
+        if batch_action_postprocess and (
+            getattr(cfg, "type", None) != "pi05" or getattr(cfg, "use_relative_actions", False)
+        ):
+            raise ValueError("batch action postprocessing requires stateless pi05 actions")
         self.residency_enabled = allow_residency
         self.residency_state = "resident"
         self.residency_epoch = 0
@@ -175,6 +183,10 @@ class LiberoChunkPolicy:
         self.env_preprocessor, self.env_postprocessor = make_env_pre_post_processors(
             env_cfg=self.env_cfg, policy_cfg=cfg
         )
+        if self.batch_action_postprocess:
+            from lerobot.utils.trinity_action_postprocess import check_batch_postprocess
+
+            check_batch_postprocess(cfg, self.postprocessor, self.env_postprocessor)
         self.device = self.policy.config.device
         self.prefix_hooks = install_prefix_boundaries(self.policy, self.device)
 
@@ -281,6 +293,10 @@ class LiberoChunkPolicy:
         torch = self.torch
         self.last_inference_metadata = None
         self.last_policy_chunk = None
+        if getattr(self, "batch_action_postprocess", False):
+            from lerobot.utils.trinity_action_postprocess import check_batch_postprocess
+
+            check_batch_postprocess(self.policy.config, self.postprocessor, self.env_postprocessor)
         missing = [name for name in REQUEST_ARRAYS if name not in arrays]
         if missing:
             raise ValueError(f"request lacks {missing}")
@@ -333,12 +349,22 @@ class LiberoChunkPolicy:
                 raise ValueError("policy returned invalid full predictions for controlled noise")
         action_count: Any = getattr(self.policy.config, "n_action_steps", chunk.shape[1])
         steps = int(action_count)
-        rows = []
-        for t in range(min(steps, chunk.shape[1])):
-            action = self.postprocessor(chunk[:, t])
+        if getattr(self, "batch_action_postprocess", False):
+            count = min(steps, chunk.shape[1])
+            if count <= 0 or chunk.ndim != 3 or chunk.shape[0] != 1:
+                raise ValueError("batch action postprocessing requires a nonempty single-policy chunk")
+            action = self.postprocessor(chunk[:, :count])
             action = self.env_postprocessor({ACTION: action})[ACTION]
-            rows.append(action.to("cpu").float().numpy().reshape(-1))
-        out = np.stack(rows).astype(np.float32)
+            if action.ndim != 3 or action.shape[:2] != (1, count):
+                raise ValueError("batch action postprocessing changed the chunk shape")
+            out = action.to("cpu").float().numpy().reshape(count, -1).astype(np.float32)
+        else:
+            rows = []
+            for t in range(min(steps, chunk.shape[1])):
+                action = self.postprocessor(chunk[:, t])
+                action = self.env_postprocessor({ACTION: action})[ACTION]
+                rows.append(action.to("cpu").float().numpy().reshape(-1))
+            out = np.stack(rows).astype(np.float32)
         if out.ndim != 2 or out.shape[1] < 7 or not np.isfinite(out).all():
             raise ValueError(f"policy returned an invalid chunk of shape {out.shape}")
         actions = out[:, :7]
@@ -505,6 +531,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--residency", action="store_true", help="allow request-safe CPU/GPU park and resume")
     parser.add_argument(
+        "--batch-action-postprocess",
+        action="store_true",
+        help="batch the qualified stateless pi05 output processors and CPU copy",
+    )
+    parser.add_argument(
         "--residency-retain-mib",
         type=int,
         default=0,
@@ -523,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
         json.loads(options.policy_overrides),
         allow_residency=options.residency,
         **({"residency_retain_mib": options.residency_retain_mib} if options.residency_retain_mib else {}),
+        **({"batch_action_postprocess": True} if options.batch_action_postprocess else {}),
     )
     server = http.server.ThreadingHTTPServer(
         (options.host, options.port), make_handler(model, threading.Lock(), owner)
