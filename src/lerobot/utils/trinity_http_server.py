@@ -280,7 +280,7 @@ class LiberoChunkPolicy:
                     shadow.resumed()
                 placement = getattr(self, "_cpu_vocabulary", None)
                 if placement is not None:
-                    placement.check()
+                    placement.check(parked=target == "parked")
                 self.residency_state = target
             except BaseException:
                 self.residency_state = "fault"
@@ -492,6 +492,8 @@ def make_handler(
                     body = json.dumps(receipt, allow_nan=False).encode()
                     code = 200
                 except Exception as error:
+                    if getattr(model, "residency_cpu_vocabulary", False):
+                        traceback.print_exc()
                     body = json.dumps(
                         {"ok": False, "error": f"{type(error).__name__}: {error}"[:500]}
                     ).encode()

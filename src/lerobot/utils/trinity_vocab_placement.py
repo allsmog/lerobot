@@ -2,9 +2,51 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from lerobot.utils.import_utils import require_package
+
+
+def _scaled_embedding_type() -> Any:
+    require_package("transformers", extra="pi")
+    from transformers.models.gemma.modeling_gemma import GemmaTextScaledWordEmbedding
+
+    return GemmaTextScaledWordEmbedding
+
+
+def _embedding_kind(embedding: Any, torch: Any) -> str:
+    if "forward" in vars(embedding):
+        raise ValueError("CPU vocabulary placement rejects custom embedding forward methods")
+    if type(embedding) is torch.nn.Embedding:
+        return "plain"
+    try:
+        scaled_type = _scaled_embedding_type()
+    except ImportError as error:
+        raise ValueError("CPU vocabulary placement requires a qualified embedding class") from error
+    if type(embedding) is not scaled_type:
+        raise ValueError("CPU vocabulary placement requires a qualified embedding class")
+    tree = ast.parse(textwrap.dedent(inspect.getsource(scaled_type.forward)))
+    function = tree.body[0]
+    expected = ast.parse("super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)", mode="eval")
+    if (
+        not isinstance(function, ast.FunctionDef)
+        or function.decorator_list
+        or len(function.body) != 1
+        or not isinstance(function.body[0], ast.Return)
+        or function.body[0].value is None
+        or ast.dump(function.body[0].value) != ast.dump(expected.body)
+        or list(inspect.signature(scaled_type.forward).parameters) != ["self", "input_ids"]
+        or set(dict(embedding.named_buffers())) != {"embed_scale"}
+        or embedding.embed_scale.numel() != 1
+        or embedding.embed_scale.requires_grad
+    ):
+        raise ValueError("CPU vocabulary placement requires the qualified scaled lookup arithmetic")
+    return "gemma-scaled"
 
 
 class CpuVocabularyPlacement:
@@ -41,10 +83,16 @@ class CpuVocabularyPlacement:
         self.modules = {path: policy.get_submodule(path) for path in paths}
         embedding = self.modules[embedding_path]
         heads = [self.modules[path] for path in head_paths]
-        if type(embedding) is not torch.nn.Embedding or any(
-            type(head) is not torch.nn.Linear for head in heads
-        ):
-            raise ValueError("CPU vocabulary placement requires genuine embedding and linear modules")
+        self.embedding_kind = _embedding_kind(embedding, torch)
+        self.embedding_class_forward = type(embedding).forward
+        self.base_forward = torch.nn.Embedding.forward
+        if any(type(head) is not torch.nn.Linear for head in heads):
+            raise ValueError("CPU vocabulary placement requires genuine linear modules")
+        if self.embedding_kind == "plain" and list(embedding.buffers()):
+            raise ValueError("CPU vocabulary placement rejects extra lookup buffers")
+        self.buffer_signatures = {
+            name: (tuple(value.shape), value.dtype) for name, value in embedding.named_buffers()
+        }
         if (
             embedding.max_norm is not None
             or embedding.sparse
@@ -109,7 +157,12 @@ class CpuVocabularyPlacement:
                 if self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
                 for module in self.modules.values():
-                    module.to("cpu")
+                    # Only vocabulary weights move here. In particular the Gemma
+                    # scale buffer stays on the arithmetic device until PARK.
+                    weight = module.weight
+                    module._apply(
+                        lambda tensor, owned=weight: tensor.to("cpu") if tensor is owned else tensor
+                    )
                 if self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
                     torch.cuda.empty_cache()
@@ -125,6 +178,8 @@ class CpuVocabularyPlacement:
                 name: (id(moved[name]), tuple(moved[name].shape), moved[name].dtype)
                 for name in self.cpu_names
             }
+            self.owned_forward = self._lookup_forward
+            embedding.forward = self.owned_forward
             self.pre_hooks[embedding_path] = embedding.register_forward_pre_hook(self._before_lookup)
             self.post_hooks[embedding_path] = embedding.register_forward_hook(self._after_lookup)
             for path in head_paths:
@@ -139,7 +194,7 @@ class CpuVocabularyPlacement:
         if self.on_fault is not None:
             self.on_fault()
 
-    def check(self) -> None:
+    def check(self, *, parked: bool = False) -> None:
         try:
             if self.faulted or self.policy.training:
                 raise RuntimeError("CPU vocabulary owner is faulted or training")
@@ -147,12 +202,25 @@ class CpuVocabularyPlacement:
             embedding = self.modules[self.embedding_path]
             if (
                 params.keys() != self.parameter_names
+                or embedding.forward is not self.owned_forward
+                or type(embedding).forward is not self.embedding_class_forward
+                or self.torch.nn.Embedding.forward is not self.base_forward
                 or embedding.max_norm is not None
                 or embedding.sparse
                 or embedding.scale_grad_by_freq
                 or any(self.modules[path].bias is not None for path in self.head_paths)
             ):
                 raise RuntimeError("CPU vocabulary module behavior or topology changed")
+            buffers = dict(embedding.named_buffers())
+            expected_device = self.torch.device("cpu") if parked else self.device
+            if buffers.keys() != self.buffer_signatures.keys() or any(
+                (tuple(value.shape), value.dtype) != self.buffer_signatures[name]
+                or value.device.type != expected_device.type
+                or (expected_device.index is not None and value.device.index != expected_device.index)
+                or value.requires_grad
+                for name, value in buffers.items()
+            ):
+                raise RuntimeError("CPU vocabulary scale buffer ownership changed")
             roots = {int(params[name].untyped_storage().data_ptr()) for name in self.cpu_names}
             if len(roots) != 3 or any(
                 name not in self.cpu_names
@@ -190,7 +258,19 @@ class CpuVocabularyPlacement:
             tokens = args[0]
             if tokens.dtype not in (self.torch.int32, self.torch.int64):
                 raise ValueError("CPU vocabulary lookup requires integer token indices")
-            return (tokens.to("cpu"),)
+            return args
+        except BaseException:
+            self._fault()
+            raise
+
+    def _lookup_forward(self, input_ids: Any) -> Any:
+        try:
+            embedding = self.modules[self.embedding_path]
+            gathered = self.base_forward(embedding, input_ids.to("cpu"))
+            output = gathered.to(self.device)
+            if self.embedding_kind == "gemma-scaled":
+                output = output * embedding.embed_scale.to(embedding.weight.dtype)
+            return output
         except BaseException:
             self._fault()
             raise
@@ -200,14 +280,14 @@ class CpuVocabularyPlacement:
             self.check()
             if (
                 not isinstance(output, self.torch.Tensor)
-                or output.device.type != "cpu"
+                or output.device.type != self.device.type
+                or (self.device.index is not None and output.device.index != self.device.index)
                 or output.dtype != module.weight.dtype
                 or tuple(output.shape) != (*args[0].shape, module.embedding_dim)
             ):
                 raise RuntimeError("CPU vocabulary lookup returned an unexpected tensor")
-            result = output.to(self.device)
             self.gather_calls += 1
-            return result
+            return output
         except BaseException:
             self._fault()
             raise
@@ -229,6 +309,10 @@ class CpuVocabularyPlacement:
             "cpu_parameter_names": list(self.cpu_names),
             "cpu_storage_bytes": sum(roots.values()),
             "cpu_storage_roots": len(roots),
+            "embedding_kind": self.embedding_kind,
+            "lookup_buffer_devices": {
+                name: str(value.device) for name, value in self.modules[self.embedding_path].named_buffers()
+            },
             "table_devices": {path: str(module.weight.device) for path, module in self.modules.items()},
             "output_device": str(self.device),
             "gather_calls": self.gather_calls,

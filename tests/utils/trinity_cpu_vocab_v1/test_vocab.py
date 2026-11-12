@@ -283,3 +283,96 @@ def test_unprepared_owned_vocabulary_transition_faults_without_policy_conversion
     with pytest.raises(RuntimeError, match="prepare the owned CPU vocabulary shadow"):
         server.residency("park")
     assert not converted and server.residency_state == "fault" and not torch.cuda.is_initialized()
+
+
+class ReviewedScaledEmbedding(torch.nn.Embedding):
+    """Small CPU fixture of the reviewed deployment arithmetic, never a model."""
+
+    def __init__(self) -> None:
+        super().__init__(11, 4)
+        self.register_buffer("embed_scale", torch.tensor(2.0), persistent=False)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
+
+
+@pytest.fixture
+def scaled_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lerobot.utils import trinity_vocab_placement as vocab
+
+    monkeypatch.setattr(vocab, "_scaled_embedding_type", lambda: ReviewedScaledEmbedding)
+
+
+def test_scaled_lookup_and_buffers_preserve_original_arithmetic_and_shadow_cycles(
+    memory: None, scaled_type: None
+) -> None:
+    model = SmallTables()
+    model.lookup = ReviewedScaledEmbedding().to(dtype=torch.bfloat16).eval()
+    tokens = torch.tensor([[0, 2, 10, 7], [1, 3, 3, 9]])
+    with torch.inference_mode():
+        expected = model(tokens).clone()
+    buffers = {name: value.clone() for name, value in model.named_buffers()}
+    scale = model.lookup.embed_scale
+    placement = place(model)
+    assert model.lookup.embed_scale is scale
+    assert placement.metadata()["embedding_kind"] == "gemma-scaled"
+    shadow = ParameterShadow(
+        model, torch, "cpu", 14 * 1024**3, park_retain_bytes=32, resident_cpu_names=placement.cpu_names
+    )
+    for _ in range(2):
+        with torch.inference_mode():
+            assert torch.equal(model(tokens), expected)
+        shadow.park()
+        placement.check(parked=True)
+        shadow.restore()
+        shadow.resumed()
+        placement.check()
+        assert all(torch.equal(value, buffers[name]) for name, value in model.named_buffers())
+    assert placement.gather_calls == 2 and not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("mutation", ["forward", "buffer_shape", "buffer_dtype", "extra_buffer"])
+def test_changed_scaled_arithmetic_or_buffer_ownership_faults(
+    memory: None, scaled_type: None, mutation: str
+) -> None:
+    model = SmallTables()
+    model.lookup = ReviewedScaledEmbedding().to(dtype=torch.bfloat16).eval()
+    placement = place(model)
+    if mutation == "forward":
+        model.lookup.forward = lambda *_: torch.zeros(1)
+    elif mutation == "buffer_shape":
+        model.lookup.embed_scale = torch.ones(2, dtype=torch.bfloat16)
+    elif mutation == "buffer_dtype":
+        model.lookup.embed_scale = model.lookup.embed_scale.float()
+    else:
+        model.lookup.register_buffer("extra", torch.zeros(1))
+    with pytest.raises(RuntimeError), torch.inference_mode():
+        model.lookup(torch.tensor([[0]]))
+    assert placement.faulted and placement.gather_calls == 0
+
+
+def test_unreviewed_scaled_forward_is_refused_before_conversion(
+    memory: None, scaled_type: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = SmallTables()
+    model.lookup = ReviewedScaledEmbedding().to(dtype=torch.bfloat16).eval()
+    monkeypatch.setattr(ReviewedScaledEmbedding, "forward", lambda self, tokens: tokens)
+    with pytest.raises(ValueError, match="qualified scaled lookup arithmetic"):
+        place(model)
+    assert not model.lookup._forward_pre_hooks
+
+
+def test_instance_embedding_forward_override_is_refused_before_conversion(memory: None) -> None:
+    model = SmallTables()
+    model.lookup.forward = lambda *_: torch.zeros(1)
+    with pytest.raises(ValueError, match="custom embedding forward"):
+        place(model)
+    assert not model.lookup._forward_pre_hooks
+
+
+def test_lookup_execution_failure_faults_owner(memory: None) -> None:
+    model = SmallTables()
+    placement = place(model)
+    with pytest.raises(IndexError), torch.inference_mode():
+        model.lookup(torch.tensor([[99]]))
+    assert placement.faulted and placement.gather_calls == 0
