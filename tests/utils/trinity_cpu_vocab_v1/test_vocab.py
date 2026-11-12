@@ -376,3 +376,60 @@ def test_lookup_execution_failure_faults_owner(memory: None) -> None:
     with pytest.raises(IndexError), torch.inference_mode():
         model.lookup(torch.tensor([[99]]))
     assert placement.faulted and placement.gather_calls == 0
+
+
+@pytest.mark.parametrize("vision_device", ["cpu", "meta"])
+@pytest.mark.parametrize("video", [False, True])
+@pytest.mark.parametrize("missing_camera", [False, True])
+def test_real_image_preprocessor_follows_vision_device_instead_of_unused_output_head(
+    vision_device: str, video: bool, missing_camera: bool
+) -> None:
+    """Meta observes routing only; no checkpoint, GPU or vision inference is run."""
+    from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+
+    model = PI05Policy.__new__(PI05Policy)
+    torch.nn.Module.__init__(model)
+    key = "observation.images.image"
+    model.config = SimpleNamespace(
+        image_features={key: None, **({"missing": None} if missing_camera else {})},
+        image_resolution=(8, 8),
+    )
+    model.model = torch.nn.Module()
+    model.model.paligemma_with_expert = torch.nn.Module()
+    pali = model.model.paligemma_with_expert.paligemma = torch.nn.Module()
+    pali.lm_head = torch.nn.Linear(3, 3, bias=False)
+    pali.model = torch.nn.Module()
+    pali.model.vision_tower = torch.nn.Linear(3, 3, bias=False, device=vision_device)
+    assert next(model.parameters()) is pali.lm_head.weight
+    shape = (1, 2, 3, 8, 8) if video else (1, 3, 8, 8)
+    source = torch.linspace(0, 1, torch.tensor(shape).prod().item()).reshape(shape)
+    images, masks = model._preprocess_images({key: source})
+    assert len(images) == len(masks) == (2 if missing_camera else 1)
+    assert images[0].shape == source.shape and masks[0].shape == ((1, 2) if video else (1,))
+    assert all(tensor.device.type == vision_device for tensor in [*images, *masks])
+    if vision_device == "cpu":
+        assert torch.equal(images[0], source * 2 - 1) and masks[0].all()
+        if missing_camera:
+            assert torch.equal(images[1], torch.ones_like(source) * -1) and not masks[1].any()
+    assert not torch.cuda.is_initialized()
+
+
+def test_owned_vocabulary_inference_error_preserves_traceback_and_wire_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    running = noise_cases.RunningServer()
+    running.model.residency_cpu_vocabulary = True
+
+    def fail(*_args: Any) -> Any:
+        raise RuntimeError("original mixed-device inference error")
+
+    running.model.chunk = fail
+    try:
+        wire = noise_cases.server.pack({"request_id": 17, "task": "task", "captured_ns": 19}, {})
+        code, headers, reply = running.post(wire)
+        header, arrays = noise_cases.server.unpack(reply)
+        assert code == 409 and headers["X-Trinity-Owner"] == noise_cases.OWNER
+        assert header["error"] == "RuntimeError: original mixed-device inference error" and not arrays
+    finally:
+        running.close()
+    assert "original mixed-device inference error" in capsys.readouterr().err

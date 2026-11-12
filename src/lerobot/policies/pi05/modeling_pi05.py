@@ -1372,8 +1372,9 @@ class PI05Policy(PreTrainedPolicy):
         images = []
         img_masks = []
 
-        # Get device from model parameters
-        device = next(self.parameters()).device
+        # Images follow their compute module. An unused output head may have
+        # fixed CPU storage while the vision tower remains on CUDA.
+        device = next(self.model.paligemma_with_expert.paligemma.model.vision_tower.parameters()).device
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]

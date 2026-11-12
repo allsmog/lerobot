@@ -532,7 +532,7 @@ def make_handler(
                 )
                 code = 200
             except Exception as error:
-                if not owned:
+                if not owned or getattr(model, "residency_cpu_vocabulary", False):
                     traceback.print_exc()
                 body = pack(
                     {
