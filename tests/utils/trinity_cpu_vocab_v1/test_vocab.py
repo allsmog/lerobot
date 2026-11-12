@@ -433,3 +433,25 @@ def test_owned_vocabulary_inference_error_preserves_traceback_and_wire_error(
     finally:
         running.close()
     assert "original mixed-device inference error" in capsys.readouterr().err
+
+
+def test_fixed_cpu_table_storage_is_not_replaced_during_shadow_parking(memory: None) -> None:
+    model = SmallTables()
+    placement = place(model)
+    before = {
+        name: dict(model.named_parameters())[name].untyped_storage().data_ptr()
+        for name in placement.cpu_names
+    }
+    shadow = ParameterShadow(
+        model, torch, "cpu", 14 * 1024**3, park_retain_bytes=32, resident_cpu_names=placement.cpu_names
+    )
+    for _ in range(2):
+        shadow.park()
+        assert before == {
+            name: dict(model.named_parameters())[name].untyped_storage().data_ptr()
+            for name in placement.cpu_names
+        }
+        shadow.restore()
+        shadow.resumed()
+        placement.check()
+    assert not torch.cuda.is_initialized()

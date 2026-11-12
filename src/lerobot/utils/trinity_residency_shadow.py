@@ -142,11 +142,12 @@ class ParameterShadow:
         self._synchronize()
         by_id = {id(param): self.shadows[name] for name, param in params.items()}
         retained, retained_bytes, resident_bytes, resident_storages = self._retained(params)
+        fixed_cpu_ids = {id(params[name]) for name in self.resident_cpu_names}
 
         def move(tensor: Any) -> Any:
             # Module._apply supplies the actual Parameter objects and buffers.
             # Leave mutable buffers on the normal, value-preserving copy path.
-            if id(tensor) in retained:
+            if id(tensor) in fixed_cpu_ids or id(tensor) in retained:
                 return tensor
             return by_id[id(tensor)] if id(tensor) in by_id else tensor.to("cpu")
 

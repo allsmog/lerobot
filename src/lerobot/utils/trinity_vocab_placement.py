@@ -313,6 +313,9 @@ class CpuVocabularyPlacement:
             "lookup_buffer_devices": {
                 name: str(value.device) for name, value in self.modules[self.embedding_path].named_buffers()
             },
+            "table_storage_ids": {
+                path: int(module.weight.untyped_storage().data_ptr()) for path, module in self.modules.items()
+            },
             "table_devices": {path: str(module.weight.device) for path, module in self.modules.items()},
             "output_device": str(self.device),
             "gather_calls": self.gather_calls,
