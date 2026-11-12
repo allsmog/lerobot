@@ -100,6 +100,8 @@ def unpack(payload: bytes) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
 class LiberoChunkPolicy:
     """One pretrained policy with its saved processors and the LIBERO environment processors."""
 
+    supports_policy_noise = True
+
     def __init__(
         self,
         policy_path: str,
@@ -120,6 +122,8 @@ class LiberoChunkPolicy:
         from lerobot.utils.trinity_gate import install_prefix_boundaries
 
         self.torch = torch
+        self.last_inference_metadata: dict[str, Any] | None = None
+        self.last_policy_chunk: np.ndarray | None = None
         cfg = PreTrainedConfig.from_pretrained(policy_path)
         cfg.pretrained_path = Path(policy_path)
         cfg.device = device
@@ -249,11 +253,26 @@ class LiberoChunkPolicy:
         from lerobot.envs.utils import preprocess_observation
         from lerobot.utils.constants import ACTION
         from lerobot.utils.trinity_gate import boundary
+        from lerobot.utils.trinity_policy_noise import (
+            SCHEMA,
+            array_sha256,
+            checked_noise,
+            observation_sha256,
+        )
 
         torch = self.torch
+        self.last_inference_metadata = None
+        self.last_policy_chunk = None
         missing = [name for name in REQUEST_ARRAYS if name not in arrays]
         if missing:
             raise ValueError(f"request lacks {missing}")
+        noise = checked_noise(self.policy.config, arrays)
+        noise_fingerprint = input_fingerprint = None
+        predict_options: dict[str, Any] = {}
+        if noise is not None:
+            noise_fingerprint = array_sha256(noise)
+            input_fingerprint = observation_sha256(task, arrays, REQUEST_ARRAYS)
+            predict_options["noise"] = torch.from_numpy(noise).to(device=self.device, dtype=torch.float32)
         observation: dict[str, Any] = {
             "pixels": {
                 "image": arrays["agentview_image"][None],
@@ -275,7 +294,12 @@ class LiberoChunkPolicy:
         observation = self.env_preprocessor(observation)
         observation = self.preprocessor(observation)
         with torch.inference_mode():
-            chunk: Any = self.policy.predict_action_chunk(observation)
+            chunk: Any = self.policy.predict_action_chunk(observation, **predict_options)
+        predicted = None
+        if noise is not None:
+            predicted = chunk.detach().to("cpu").float().numpy().copy()
+            if predicted.ndim != 3 or predicted.shape[0] != 1 or not np.isfinite(predicted).all():
+                raise ValueError("policy returned invalid full predictions for controlled noise")
         action_count: Any = getattr(self.policy.config, "n_action_steps", chunk.shape[1])
         steps = int(action_count)
         rows = []
@@ -286,7 +310,30 @@ class LiberoChunkPolicy:
         out = np.stack(rows).astype(np.float32)
         if out.ndim != 2 or out.shape[1] < 7 or not np.isfinite(out).all():
             raise ValueError(f"policy returned an invalid chunk of shape {out.shape}")
-        return out[:, :7]
+        actions = out[:, :7]
+        if noise is not None and predicted is not None:
+            self.last_policy_chunk = np.ascontiguousarray(predicted[0])
+            self.last_inference_metadata = {
+                "schema": SCHEMA,
+                "noise_shape": list(noise.shape),
+                "noise_dtype": noise.dtype.str,
+                "noise_sha256": noise_fingerprint,
+                "raw_observation_sha256": input_fingerprint,
+                "predicted_shape": list(self.last_policy_chunk.shape),
+                "prediction_space": "policy_before_postprocessing",
+                "predicted_sha256": array_sha256(self.last_policy_chunk),
+                "actions_shape": list(actions.shape),
+                "actions_space": "libero_environment_after_postprocessing",
+                "actions_sha256": array_sha256(actions),
+                "policy_config": {
+                    "type": self.policy.config.type,
+                    "chunk_size": self.policy.config.chunk_size,
+                    "max_action_dim": self.policy.config.max_action_dim,
+                    "n_action_steps": steps,
+                    "dtype": str(getattr(self.policy.config, "dtype", None)),
+                },
+            }
+        return actions
 
 
 def checked_owner(owner: str | None) -> str:
@@ -365,18 +412,31 @@ def make_handler(
             try:
                 payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 header, arrays = unpack(payload)
+                provenance = predictions = None
                 with lock:
                     self.identity()
+                    if "policy_noise" in arrays and not getattr(model, "supports_policy_noise", False):
+                        raise ValueError("policy does not support explicit noise")
                     actions = model.chunk(str(header.get("task", "")), arrays)
+                    if "policy_noise" in arrays:
+                        provenance = model.last_inference_metadata
+                        predictions = model.last_policy_chunk
+                        if provenance is None or predictions is None:
+                            raise ValueError("policy did not return controlled-noise provenance")
                     if owned:
                         self.response_generation = model.residency_epoch + 1
+                reply_arrays: dict[str, np.ndarray] = {"actions": actions}
+                reply_header: dict[str, Any] = {
+                    "request_id": header.get("request_id"),
+                    "captured_ns": header.get("captured_ns"),
+                    "error": None,
+                }
+                if provenance is not None and predictions is not None:
+                    reply_header["policy_provenance"] = provenance
+                    reply_arrays["predicted_actions"] = predictions
                 body = pack(
-                    {
-                        "request_id": header.get("request_id"),
-                        "captured_ns": header.get("captured_ns"),
-                        "error": None,
-                    },
-                    {"actions": actions},
+                    reply_header,
+                    reply_arrays,
                 )
                 code = 200
             except Exception as error:
