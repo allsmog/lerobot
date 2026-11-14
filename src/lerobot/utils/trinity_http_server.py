@@ -331,17 +331,22 @@ class LiberoChunkPolicy:
             return self._chunk(task, arrays)
         if self.residency_state != "resident":
             raise RuntimeError("policy is not resident: " + self.residency_state)
-        with self.torch.cuda.stream(stream):
-            try:
-                return self._chunk(task, arrays)
-            finally:
+        self.last_inference_metadata = None
+        self.last_policy_chunk = None
+        with self.torch.cuda.device(stream.device):
+            # Fresh request threads need a real current context before the shim queues work.
+            self.torch.cuda.set_device(stream.device)
+            with self.torch.cuda.stream(stream):
                 try:
-                    stream.synchronize()
-                except BaseException:
-                    self.residency_state = "fault"
-                    self.last_inference_metadata = None
-                    self.last_policy_chunk = None
-                    raise
+                    return self._chunk(task, arrays)
+                finally:
+                    try:
+                        stream.synchronize()
+                    except BaseException:
+                        self.residency_state = "fault"
+                        self.last_inference_metadata = None
+                        self.last_policy_chunk = None
+                        raise
 
     def _chunk(self, task: str, arrays: dict[str, np.ndarray]) -> np.ndarray:
         if self.residency_state != "resident":

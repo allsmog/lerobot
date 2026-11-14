@@ -25,10 +25,13 @@ class ObservableStream:
     """A labeled CPU port that records context, dependency and drain ordering."""
 
     cuda_stream = 1234
+    device = torch.device("cuda:0")
 
     def __init__(self) -> None:
         self.local = threading.local()
         self.entries = self.exits = self.drains = 0
+        self.device_entries = self.device_exits = self.selections = 0
+        self.selection_error: BaseException | None = None
         self.dependencies: list[Any] = []
         self.drain_entered = threading.Event()
         self.drain_release = threading.Event()
@@ -42,9 +45,36 @@ class ObservableStream:
     def wait_stream(self, other: Any) -> None:
         self.dependencies.append(other)
 
+    @property
+    def device_active(self) -> bool:
+        return getattr(self.local, "device_active", False)
+
+    @contextmanager
+    def device_context(self, device: Any) -> Iterator[None]:
+        assert device == self.device
+        previous = self.device_active
+        bound = getattr(self.local, "bound", False)
+        self.local.device_active = True
+        self.local.bound = False
+        self.device_entries += 1
+        try:
+            yield
+        finally:
+            self.local.device_active = previous
+            self.local.bound = bound
+            self.device_exits += 1
+
+    def set_device(self, device: Any) -> None:
+        assert device == self.device and self.device_active and not self.active
+        self.selections += 1
+        if self.selection_error is not None:
+            raise self.selection_error
+        self.local.bound = True
+
     @contextmanager
     def context(self, stream: Any) -> Iterator[None]:
         assert stream is self
+        assert self.device_active and getattr(self.local, "bound", False)
         previous = self.active
         self.local.active = True
         self.entries += 1
@@ -67,6 +97,8 @@ def enable(monkeypatch: pytest.MonkeyPatch, model: Any, stream: ObservableStream
     model.dedicated_cuda_stream = True
     model._request_stream = stream
     monkeypatch.setattr(torch.cuda, "stream", stream.context)
+    monkeypatch.setattr(torch.cuda, "device", stream.device_context)
+    monkeypatch.setattr(torch.cuda, "set_device", stream.set_device)
 
 
 def test_complete_real_chunk_includes_noise_observer_and_postprocess(
@@ -116,6 +148,7 @@ def test_complete_real_chunk_includes_noise_observer_and_postprocess(
     assert np.array_equal(output, noise[0, :, :7] + 0.25)
     assert len(calls) == 1
     assert stream.entries == stream.exits == stream.drains == 1 and not stream.active
+    assert stream.device_entries == stream.device_exits == stream.selections == 1 and not stream.device_active
 
 
 def test_request_error_still_drains_and_restores_context(
@@ -132,6 +165,7 @@ def test_request_error_still_drains_and_restores_context(
     with pytest.raises(LookupError, match="original prediction error"):
         model.chunk("task", {**noise_cases.observation(), NOISE_ARRAY: noise_cases.explicit_noise()})
     assert stream.entries == stream.exits == stream.drains == 1 and not stream.active
+    assert stream.device_entries == stream.device_exits == stream.selections == 1 and not stream.device_active
     assert model.last_policy_chunk is None and model.last_inference_metadata is None
     assert model.residency_state == "resident"
 
@@ -149,6 +183,7 @@ def test_drain_failure_faults_the_policy_and_refuses_later_requests(
     assert model.residency_state == "fault"
     assert model.last_policy_chunk is None and model.last_inference_metadata is None
     assert stream.entries == stream.exits == stream.drains == 1 and not stream.active
+    assert stream.device_entries == stream.device_exits == stream.selections == 1 and not stream.device_active
     with pytest.raises(RuntimeError, match="not resident: fault"):
         model.chunk("task", arrays)
     assert stream.entries == stream.drains == 1
@@ -198,6 +233,8 @@ def test_default_chunk_does_not_select_a_cuda_context(policy: Any, monkeypatch: 
         raise AssertionError("default chunk selected a CUDA context")
 
     monkeypatch.setattr(torch.cuda, "stream", forbidden)
+    monkeypatch.setattr(torch.cuda, "device", forbidden)
+    monkeypatch.setattr(torch.cuda, "set_device", forbidden)
     output = model.chunk("task", noise_cases.observation())
     assert output.shape == (50, 7)
 
@@ -271,3 +308,20 @@ def test_cli_forwards_the_explicit_stream_option(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(StopBeforeLoadingError):
         server.main(["--policy-path", "unused", "--port", "12345", "--dedicated-cuda-stream"])
     assert seen[0]["dedicated_cuda_stream"] is True
+
+
+def test_device_binding_failure_restores_and_does_not_reuse_old_metadata(
+    policy: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, calls = real_policy_port(policy)
+    stream = ObservableStream()
+    stream.selection_error = RuntimeError("controlled context binding failure")
+    enable(monkeypatch, model, stream)
+    model.last_policy_chunk = np.ones((50, 32), dtype=np.float32)
+    model.last_inference_metadata = {"old": True}
+    with pytest.raises(RuntimeError, match="context binding failure"):
+        model.chunk("task", {**noise_cases.observation(), NOISE_ARRAY: noise_cases.explicit_noise()})
+    assert stream.device_entries == stream.device_exits == stream.selections == 1
+    assert not stream.device_active and not stream.active
+    assert stream.entries == stream.drains == 0 and not calls
+    assert model.last_policy_chunk is None and model.last_inference_metadata is None
