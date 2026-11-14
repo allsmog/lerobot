@@ -116,7 +116,12 @@ class LiberoChunkPolicy:
         residency_retain_mib: int = 0,
         batch_action_postprocess: bool = False,
         residency_cpu_vocabulary: bool = False,
+        dedicated_cuda_stream: bool = False,
     ) -> None:
+        if not isinstance(dedicated_cuda_stream, bool):
+            raise ValueError("dedicated CUDA stream selection must be a boolean")
+        self.dedicated_cuda_stream = dedicated_cuda_stream
+        self._request_stream: Any = None
         if not isinstance(residency_cpu_vocabulary, bool):
             raise ValueError("CPU vocabulary placement must be a boolean")
         if residency_cpu_vocabulary and not allow_residency:
@@ -136,6 +141,9 @@ class LiberoChunkPolicy:
             raise ValueError("residency retention requires owned residency")
         self.residency_retain_bytes = residency_retain_mib * 1024**2
         import torch
+
+        if dedicated_cuda_stream and torch.device(device).type != "cuda":
+            raise ValueError("dedicated CUDA request stream requires a CUDA device")
 
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.envs.configs import LiberoEnv
@@ -197,6 +205,9 @@ class LiberoChunkPolicy:
             check_batch_postprocess(cfg, self.postprocessor, self.env_postprocessor)
         self.device = self.policy.config.device
         self.prefix_hooks = install_prefix_boundaries(self.policy, self.device)
+        if dedicated_cuda_stream:
+            self._request_stream = torch.cuda.Stream(device=self.device)
+            self._request_stream.wait_stream(torch.cuda.current_stream(self.device))
 
     def prepare_residency_shadow(self, host_reserve_bytes: int) -> dict[str, Any]:
         """Retain CPU parameter copies once, under the same inference lock.
@@ -305,9 +316,34 @@ class LiberoChunkPolicy:
         if getattr(self, "residency_cpu_vocabulary", False):
             placement = getattr(self, "_cpu_vocabulary", None)
             result["cpu_vocabulary"] = {"prepared": False} if placement is None else placement.metadata()
+        stream = getattr(self, "_request_stream", None)
+        if stream is not None:
+            result["request_stream"] = {
+                "mode": "dedicated_cuda",
+                "device": str(self.device),
+                "stream": int(stream.cuda_stream),
+            }
         return result
 
     def chunk(self, task: str, arrays: dict[str, np.ndarray]) -> np.ndarray:
+        stream = getattr(self, "_request_stream", None)
+        if stream is None:
+            return self._chunk(task, arrays)
+        if self.residency_state != "resident":
+            raise RuntimeError("policy is not resident: " + self.residency_state)
+        with self.torch.cuda.stream(stream):
+            try:
+                return self._chunk(task, arrays)
+            finally:
+                try:
+                    stream.synchronize()
+                except BaseException:
+                    self.residency_state = "fault"
+                    self.last_inference_metadata = None
+                    self.last_policy_chunk = None
+                    raise
+
+    def _chunk(self, task: str, arrays: dict[str, np.ndarray]) -> np.ndarray:
         if self.residency_state != "resident":
             raise RuntimeError("policy is not resident: " + self.residency_state)
         from lerobot.envs.utils import preprocess_observation
@@ -556,6 +592,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--dedicated-cuda-stream",
+        action="store_true",
+        help="run each complete chunk on one owned CUDA stream",
+    )
     parser.add_argument("--task-suite", default="libero_object")
     parser.add_argument("--dtype", default=None, help="policy dtype override, for example bfloat16")
     parser.add_argument(
@@ -598,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"residency_retain_mib": options.residency_retain_mib} if options.residency_retain_mib else {}),
         **({"batch_action_postprocess": True} if options.batch_action_postprocess else {}),
         **({"residency_cpu_vocabulary": True} if options.residency_cpu_vocabulary else {}),
+        **({"dedicated_cuda_stream": True} if options.dedicated_cuda_stream else {}),
     )
     server = http.server.ThreadingHTTPServer(
         (options.host, options.port), make_handler(model, threading.Lock(), owner)
